@@ -1,83 +1,125 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 import json
-import mintotp
 import traceback
+import mintotp
 import os
 import time
+import sys
 
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 
 
+def load_credentials():
+    json_file = os.path.join(current_file_path, "credentials.json")
+    with open(json_file) as f:
+        return json.load(f)
+
+
 def get_client_doc_from_json(client_id):
-   try:
-       json_file = os.path.join(current_file_path,'credentials.json')
-       with open(json_file) as f:
-           data = json.load(f)
-           return data[client_id]
-   except Exception as e:
-       traceback.print_exc()
+    try:
+        return load_credentials()[client_id]
+    except Exception:
+        traceback.print_exc()
+
 
 def get_totp(userid):
-    totp_key = get_client_doc_from_json(userid)['totp_key']
+    totp_key = get_client_doc_from_json(userid)["totp_key"]
     totp = mintotp.totp(totp_key)
     return totp
 
-def disable_segment(client_id):
+
+def create_driver():
+    options = webdriver.ChromeOptions()
+    options.binary_location = "/usr/bin/google-chrome"
+
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+
+    return webdriver.Chrome(options=options)
+
+
+def disable_segment(client_id, driver):
     try:
-        password = get_client_doc_from_json(client_id)['password']
+        password = get_client_doc_from_json(client_id)["password"]
         #! Get to the console - segment activation page
         driver.get("https://console.zerodha.com/account/segment-activation")
         time.sleep(2)
-       
-        
-        #! Login
-        driver.find_element(by=By.ID,value="userid").send_keys(client_id)
-        time.sleep(1)
-        driver.find_element(by=By.ID,value="password").send_keys(password)
-        time.sleep(1)
-        driver.find_element(by = By.XPATH, value = "/html/body/div[1]/div/div/div[1]/div/div/div/form/div[4]/button").click()
-        time.sleep(1)
-        driver.find_element(by = By.XPATH, value = "/html/body/div[1]/div/div/div[1]/div[2]/div/div/form/div[1]/input").send_keys(get_totp(client_id))
-        time.sleep(5)
 
+        #! Login
+        driver.find_element(by=By.ID, value="userid").send_keys(client_id)
+        time.sleep(1)
+        driver.find_element(by=By.ID, value="password").send_keys(password)
+        time.sleep(1)
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[1]/div/div/div[1]/div/div/div/form/div[4]/button",
+        ).click()
+        time.sleep(1)
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[1]/div/div/div[1]/div[2]/div/div/form/div[1]/input",
+        ).send_keys(get_totp(client_id))
+        time.sleep(5)
 
         #! Disable the NSE-FO segment.
         #! To add different segments, you can always copy xpath from inspecting element and replace below xpath.
-        driver.find_element(by = By.XPATH, value = "/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/div[2]/div/div/div/div[3]/div/div/div/label").click()
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/div[2]/div/div/div/div[3]/div/div/div/label",
+        ).click()
+        time.sleep(1)
+
+        # Disable th BSE-FO sengment
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/div[2]/div/div/div/div[5]/div/div/div/label",
+        ).click()
+        time.sleep(1)
+
+        # Disable the Commodity sengment
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/div[2]/div/div/div/div[4]/div/div/div/label",
+        ).click()
         time.sleep(1)
 
         #! Clicking on continue
-        driver.find_element(by = By.XPATH, value = "/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/button").click()
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[2]/div[2]/div/div/div/div[2]/div[1]/div[2]/div[4]/div[1]/button",
+        ).click()
         time.sleep(5)
 
         #! Clicking on confirm-page continue button
-        driver.find_element(by = By.XPATH, value = "/html/body/div[2]/div[2]/div/div/div[2]/div/div/div/div/form/div[2]/button[2]").click()
+        driver.find_element(
+            by=By.XPATH,
+            value="/html/body/div[2]/div[2]/div/div/div[2]/div/div/div/div/form/div[2]/button[2]",
+        ).click()
         time.sleep(10)
 
-        #! Exit the browser
-        driver.quit()
-    except:
+    except Exception:
         traceback.print_exc()
 
 
 def main(client_id):
-    global driver
-    options = webdriver.ChromeOptions()
-    options.binary_location = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'
-    options.add_experimental_option("detach", True)
-    driver = webdriver.Chrome(options=options)
-    # options.add_argument("--headless")
-    disable_segment(client_id)
+    driver = create_driver()
+    try:
+        disable_segment(client_id, driver)
+    finally:
+        driver.quit()
 
 
-if __name__ == '__main__':
-    global driver
-    options = webdriver.ChromeOptions()
-    options.binary_location = '/Applications/Brave Browser.app/Contents/MacOS/Brave Browser'
-    options.add_experimental_option("detach", True)
-    driver = webdriver.Chrome(options=options)
-    # options.add_argument("--headless")
-    disable_segment("<your client id here>")
-    # driver.quit()
+def run_all_clients():
+    credentials = load_credentials()
+
+    for client_id in credentials.keys():
+        main(client_id)
+
+
+if __name__ == "__main__":
+    run_all_clients()
