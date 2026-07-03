@@ -12,6 +12,7 @@ import pytz
 import logging
 import csv
 import subprocess 
+import fcntl
 import config
 import get_kite_client
 
@@ -25,6 +26,8 @@ logger = get_logger.get_logger("Risk_Manager")
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 subscribed_tokens=set()
+price_cache = {}
+risk_manager_lock = None
 
 
 kill_switch_path = os.path.join(
@@ -43,6 +46,19 @@ JOURNAL_FILE = os.path.join(
     "trade_journal.csv"
 )
 
+RISK_MANAGER_LOCK_FILE = os.path.join(
+    current_file_path,
+    "risk_manager.lock"
+)
+
+
+class StaleMarketDataError(Exception):
+    pass
+
+
+class RiskCalculationError(Exception):
+    pass
+
 def load_risk_state():
 
     if not os.path.exists(RISK_STATE_FILE):
@@ -51,7 +67,8 @@ def load_risk_state():
             "date": "",
             "lockdown": False,
             "reason": "",
-            "peak_mtm": 0
+            "peak_mtm": 0,
+            "kill_switch_triggered": False
         }
 
     with open(RISK_STATE_FILE) as f:
@@ -71,27 +88,18 @@ def now_ist_string():
 
 
 def save_risk_state(state):
+    temp_file = f"{RISK_STATE_FILE}.tmp"
 
-    with open(RISK_STATE_FILE, "w") as f:
+    with open(temp_file, "w") as f:
         json.dump(
             state,
             f,
             indent=4
         )
+        f.flush()
+        os.fsync(f.fileno())
 
-
-def get_client_risk_state(state, client_id):
-    clients = state.setdefault(
-        "clients",
-        {}
-    )
-
-    return clients.setdefault(
-        client_id,
-        {
-            "peak_mtm": 0
-        }
-    )
+    os.replace(temp_file, RISK_STATE_FILE)
 
 
 def log_journal(
@@ -156,8 +164,7 @@ def activate_lockdown(reason, client_id=""):
         reason=reason
     )
 
-    cancel_all_orders(kite)
-    exit_all_positions(kite)
+    enforce_lockdown_clear(client_id)
 
 
 def monitor_lockdown(positions):
@@ -179,8 +186,7 @@ def monitor_lockdown(positions):
             log_journal(
                 event="POSITION_DETECTED_DURING_LOCKDOWN"
             )
-            cancel_all_orders(kite)
-            exit_all_positions(kite)
+            enforce_lockdown_clear()
 
     except Exception:
 
@@ -200,42 +206,26 @@ def get_opening_balance(kite):
     return margins["equity"]["net"]
     # return margins 
 
-def update_peak_mtm(mtm, client_id):
+def update_peak_mtm(mtm):
 
     state = load_risk_state()
-    client_state = get_client_risk_state(
-        state,
-        client_id
-    )
-
-    peak = client_state.get(
-        "peak_mtm",
-        0
-    )
+    peak = state.get("peak_mtm", 0)
 
     if mtm > peak:
 
-        client_state["peak_mtm"] = mtm
-        state["peak_mtm"] = max(
-            state.get("peak_mtm", 0),
-            mtm
-        )
+        state["peak_mtm"] = mtm
 
         save_risk_state(state)
 
         logger.info(
-            f"{client_id} New Peak MTM={mtm}"
+            f"New Peak MTM={mtm}"
         )
 
 
-def check_profit_protection(mtm, opening_balance, client_id):
+def check_profit_protection(mtm, opening_balance, client_id=""):
     state = load_risk_state()
-    client_state = get_client_risk_state(
-        state,
-        client_id
-    )
 
-    config.PEAK_MTM = client_state.get(
+    config.PEAK_MTM = state.get(
     "peak_mtm",
     0
     )
@@ -277,8 +267,16 @@ def check_profit_protection(mtm, opening_balance, client_id):
     return False
 
 def on_ticks(ws, ticks):
+    now = time.monotonic()
     for tick in ticks:
-        config.live_ltp_dict[tick["instrument_token"]]=tick["last_price"]
+        token = tick["instrument_token"]
+        price = tick["last_price"]
+        config.live_ltp_dict[token]=price
+        price_cache[token] = {
+            "price": price,
+            "received_at": now,
+            "source": "websocket"
+        }
         # print(f"Received {len(ticks)} ticks")
         # token = tick['instrument_token']
         # print(tick["instrument_token"])
@@ -315,15 +313,135 @@ def on_connect(ws, response):
     except Exception as e:
         logging.error(f"Error subscribing: {e}")
 
-def start_websocket(client_id):
 
-    api_key = get_kite_client.get_client_doc_from_json(
-        client_id
-    )["api_key"]
+def on_close(ws, code, reason):
+    logger.warning(
+        f"Risk_Manager WebSocket closed. code={code}, reason={reason}"
+    )
+    log_journal(
+        event="WEBSOCKET_CLOSED",
+        reason=f"code={code}, reason={reason}"
+    )
 
-    access_token = get_kite_client.get_client_doc_from_json(
-        client_id
-    )["access_token"]
+
+def on_error(ws, code, reason):
+    logger.error(
+        f"Risk_Manager WebSocket error. code={code}, reason={reason}"
+    )
+    log_journal(
+        event="WEBSOCKET_ERROR",
+        reason=f"code={code}, reason={reason}"
+    )
+
+
+def get_position_instrument(position):
+    return f"{position['exchange']}:{position['tradingsymbol']}"
+
+
+def get_cached_price(token, now):
+    cached = price_cache.get(token)
+
+    if not cached:
+        return None
+
+    age = now - cached["received_at"]
+    if age > config.PRICE_MAX_AGE_SECONDS:
+        return None
+
+    return cached["price"]
+
+
+def get_positions_needing_price_refresh(positions):
+    now = time.monotonic()
+    stale_positions = []
+
+    for position in positions:
+        if position["quantity"] == 0:
+            continue
+
+        token = position["instrument_token"]
+        if get_cached_price(token, now) is None:
+            stale_positions.append(position)
+
+    return stale_positions
+
+
+def refresh_prices_from_rest(positions):
+    if not positions:
+        return
+
+    instruments_by_token = {
+        position["instrument_token"]: get_position_instrument(position)
+        for position in positions
+    }
+
+    try:
+        quotes = kite.ltp(list(instruments_by_token.values()))
+    except Exception:
+        logger.exception(
+            "Failed to refresh stale market data through REST LTP."
+        )
+        return
+
+    now = time.monotonic()
+
+    for token, instrument in instruments_by_token.items():
+        quote = quotes.get(instrument)
+
+        if not quote or quote.get("last_price") is None:
+            logger.warning(
+                f"REST LTP missing for {instrument}"
+            )
+            continue
+
+        price = quote["last_price"]
+        config.live_ltp_dict[token] = price
+        price_cache[token] = {
+            "price": price,
+            "received_at": now,
+            "source": "rest"
+        }
+
+
+def ensure_fresh_prices(positions):
+    stale_positions = get_positions_needing_price_refresh(positions)
+
+    if stale_positions:
+        logger.warning(
+            "Refreshing stale/missing prices for "
+            f"{[get_position_instrument(position) for position in stale_positions]}"
+        )
+        refresh_prices_from_rest(stale_positions)
+
+    still_stale_positions = get_positions_needing_price_refresh(positions)
+
+    if still_stale_positions:
+        instruments = [
+            get_position_instrument(position)
+            for position in still_stale_positions
+        ]
+        raise StaleMarketDataError(
+            f"Fresh market data unavailable for {instruments}"
+        )
+
+
+def get_fresh_price(position):
+    token = position["instrument_token"]
+    price = get_cached_price(token, time.monotonic())
+
+    if price is None:
+        raise StaleMarketDataError(
+            f"Fresh market data unavailable for {get_position_instrument(position)}"
+        )
+
+    return price
+
+def start_websocket():
+
+    client_doc = get_kite_client.get_client_doc_from_json()
+
+    api_key = client_doc["api_key"]
+    access_token = client_doc["access_token"]
 
     config.kws = KiteTicker(
         api_key,
@@ -332,6 +450,8 @@ def start_websocket(client_id):
 
     config.kws.on_ticks = on_ticks
     config.kws.on_connect = on_connect
+    config.kws.on_close = on_close
+    config.kws.on_error = on_error
 
 def get_all_positions():
     positions = kite.positions()
@@ -398,14 +518,18 @@ def sync_subscriptions():
 def calculate_mtm(positions):
     if config.kws and not config.kws.is_connected():
         logger.warning(
-            "WebSocket not connected. Calculating MTM with position last_price fallback."
+            "WebSocket not connected. MTM will require fresh REST LTP fallback."
         )
+
+    ensure_fresh_prices(positions)
 
     total_mtm=0.0
 
     for pos in positions:
-        token = pos["instrument_token"]
-        current_price = config.live_ltp_dict.get(token, pos["last_price"])
+        current_price = 0
+
+        if pos["quantity"] != 0:
+            current_price = get_fresh_price(pos)
 
         mtm = (pos['sell_value'] - pos['buy_value']) + \
                 (pos['quantity'] * current_price * pos['multiplier'])
@@ -440,9 +564,12 @@ def check_kill_condition(kite,positions):
 
 
         return total_mtm, completed_orders_count, open_positions
+    except StaleMarketDataError:
+        raise
     except Exception as e:
-        logger.error(f"Error calculating MTM: {traceback.format_exc()}")
-        return 0, 0, 0
+        raise RiskCalculationError(
+            f"Error calculating MTM: {traceback.format_exc()}"
+        )
 
 
 def cancel_all_orders(kite):
@@ -500,6 +627,69 @@ def exit_all_positions(kite):
         logger.error(f"Error exiting positions: {traceback.format_exc()}")
 
 
+def get_active_orders(kite):
+    inactive_statuses = {
+        "COMPLETE",
+        "CANCELLED",
+        "REJECTED"
+    }
+
+    return [
+        order
+        for order in kite.orders()
+        if order["status"] not in inactive_statuses
+    ]
+
+
+def enforce_lockdown_clear(client_id=""):
+    for attempt in range(1, config.LOCKDOWN_VERIFY_ATTEMPTS + 1):
+        try:
+            active_orders = get_active_orders(kite)
+            positions = kite.positions()["net"]
+            open_positions = [
+                position
+                for position in positions
+                if position["quantity"] != 0
+            ]
+
+            if not active_orders and not open_positions:
+                logger.info(
+                    "Lockdown verified: no active orders or open positions."
+                )
+                log_journal(
+                    event="LOCKDOWN_VERIFIED",
+                    client_id=client_id,
+                    reason="No active orders or open positions"
+                )
+                return True
+
+            logger.warning(
+                f"Lockdown verification attempt {attempt}: "
+                f"active_orders={len(active_orders)}, "
+                f"open_positions={len(open_positions)}"
+            )
+
+            cancel_all_orders(kite)
+            exit_all_positions(kite)
+
+        except Exception:
+            logger.exception(
+                f"Lockdown verification attempt {attempt} failed"
+            )
+
+        time.sleep(config.LOCKDOWN_VERIFY_SLEEP_SECONDS)
+
+    logger.error(
+        "Lockdown verification failed after all attempts."
+    )
+    log_journal(
+        event="LOCKDOWN_VERIFY_FAILED",
+        client_id=client_id,
+        reason="Active orders or open positions may remain after lockdown"
+    )
+    return False
+
+
 def is_market_open():
     now = dt.datetime.now(ist)
     return (
@@ -537,21 +727,16 @@ def ensure_daily_threshold(kite,opening_balance):
 
     return daily_loss_limit
 
-def load_credentials():
-    json_file = os.path.join(current_file_path, "credentials.json")
-    with open(json_file) as f:
-        return json.load(f)
-
-
-def run_engine(client_id):
+def run_engine():
+    client_id = get_kite_client.get_single_client_id()
 
     logger.info(
         f"Starting Restart-Safe Trading Risk Engine for {client_id}"
     )
     global kite
 
-    kite = get_kite_client.get_kite_client(client_id)
-    start_websocket(client_id)
+    kite = get_kite_client.get_kite_client()
+    start_websocket()
     config.kws.connect(threaded=True)
     time.sleep(2)
     
@@ -563,7 +748,7 @@ def run_engine(client_id):
     log_file = open(os.path.join(current_file_path, "SL_manager.log"), "a")
 
     process = subprocess.Popen(
-        [sys.executable, SL_manager_path, client_id],
+        [sys.executable, SL_manager_path],
         stdout=log_file,
         stderr=log_file,
         start_new_session=True
@@ -591,8 +776,7 @@ def run_engine(client_id):
                     "lockdown": False,
                     "reason": "",
                     "peak_mtm": 0,
-                    "kill_switch_triggered": False,
-                    "clients": {}
+                    "kill_switch_triggered": False
                 }
                 save_risk_state(state)
 
@@ -619,7 +803,7 @@ def run_engine(client_id):
 
             try:
                 MTM, order_len, open_orders = check_kill_condition(kite,positions)
-                update_peak_mtm(MTM, client_id)
+                update_peak_mtm(MTM)
 
                 logger.info(
                     f"{client_id} MTM: {MTM} | Threshold: {loss_threshold}"
@@ -653,10 +837,37 @@ def run_engine(client_id):
                         activate_lockdown("No Trading After 2:15 PM", client_id)
 
 
+            except StaleMarketDataError:
+                logger.error(
+                    f"Stale market data. Skipping MTM checks without cancelling orders: "
+                    f"{traceback.format_exc()}"
+                )
+                log_journal(
+                    event="STALE_MARKET_DATA",
+                    client_id=client_id,
+                    reason="Fresh LTP unavailable; skipped MTM cycle without cancelling orders"
+                )
+            except RiskCalculationError:
+                logger.error(
+                    f"Risk calculation failed for {client_id}:\n{traceback.format_exc()}"
+                )
+                log_journal(
+                    event="RISK_CALCULATION_FAILED",
+                    client_id=client_id,
+                    reason="Risk calculation failed; activating lockdown"
+                )
+                activate_lockdown("Risk Calculation Failed", client_id)
+                sys.exit()
             except Exception:
                 logger.error(
                     f"Error processing {client_id}:\n{traceback.format_exc()}"
                 )
+                log_journal(
+                    event="RISK_ENGINE_ERROR",
+                    client_id=client_id,
+                    reason="Unexpected risk engine error; activating lockdown"
+                )
+                activate_lockdown("Risk Engine Error", client_id)
                 sys.exit()
             # print("Sleeping for {} seconds...".format(config.CHECK_INTERVAL), "\n\n\n\n\n")
             # Maintain fixed interval
@@ -670,43 +881,34 @@ def run_engine(client_id):
         sys.exit()
 
 
-def run_all_clients():
-    credentials = load_credentials()
+def acquire_risk_manager_lock():
+    global risk_manager_lock
 
-    if len(sys.argv) > 1:
-        client_id = sys.argv[1]
-        if client_id not in credentials:
-            logger.error(
-                f"Unknown client id for Risk Manager: {client_id}"
-            )
-            sys.exit(1)
-        run_engine(client_id)
-        return
-
-    client_ids = list(credentials.keys())
-
-    if len(client_ids) == 1:
-        run_engine(client_ids[0])
-        return
-
-    processes = []
-    for client_id in client_ids:
-        processes.append(
-            subprocess.Popen(
-                [sys.executable, __file__, client_id],
-                start_new_session=True
-            )
-        )
+    risk_manager_lock = open(RISK_MANAGER_LOCK_FILE, "w")
 
     try:
-        for process in processes:
-            process.wait()
-    except KeyboardInterrupt:
-        for process in processes:
-            process.terminate()
-        raise
+        fcntl.flock(
+            risk_manager_lock,
+            fcntl.LOCK_EX | fcntl.LOCK_NB
+        )
+    except BlockingIOError:
+        logger.error(
+            "Another Risk Manager process is already running."
+        )
+        sys.exit(1)
+
+
+def main():
+    if len(sys.argv) > 1:
+        logger.error(
+            "Risk Manager runs in single-client mode and does not accept a client id argument."
+        )
+        sys.exit(1)
+
+    acquire_risk_manager_lock()
+    run_engine()
 
 
 if __name__ == "__main__":
-    run_all_clients()
+    main()
     

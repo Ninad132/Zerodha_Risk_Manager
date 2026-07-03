@@ -25,6 +25,8 @@ This project is a simple kill switch for a kite. It is designed to stop overtrad
 ## Configuration
 A template configuration file (`credentials_template.json`) is provided in the repository. You can copy the template and rename it to `credentials.json`. Then you can modify the configuration file to suit your needs.
 
+This project runs in single-client mode. `credentials.json` must contain exactly one client entry. If more than one client is configured, the login app, risk manager, SL manager, and kill switch will stop with an error.
+
 > You need to have the necessary API credentials to run the script. You can get the API credentials from the [Kite Connect](https://kite.trade/).
 
 > TOTP must be enabled in your Kite account for this project to work.
@@ -32,7 +34,7 @@ A template configuration file (`credentials_template.json`) is provided in the r
 > Please ensure that you have the necessary API credentials in the `credentials.json` file before running the script. Without the correct credentials, the script will not be able to access the necessary data and perform the required actions.
 
 ## Usage
-1. Run `position_kill_switch.py`.
+1. Run `login_kite.py` to refresh the access token and start the risk manager, or run `positions_kill_switch.py` directly after a valid access token exists.
 2. The script will check if you have any open positions.
 3. Then the script will check if the total loss is above threshold.
 4. If the loss is above threshold, the script will close positions, cancel all orders and activate the kill switch.

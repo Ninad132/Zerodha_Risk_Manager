@@ -8,12 +8,12 @@ from kiteconnect import KiteTicker
 import datetime as dt
 import pytz
 import sys
-import subprocess
 
 ist = pytz.timezone("Asia/Kolkata")
 current_file_path = os.path.dirname(os.path.realpath(__file__))
 logger = get_logger.get_logger("SL_Manager")
 subscribed_tokens=set()
+price_cache = {}
 ACTIVE_SL_ORDER_STATUSES = {
     "OPEN",
     "OPEN PENDING",
@@ -46,12 +46,21 @@ def is_lockdown_activated():
     return state.get("lockdown",False)
 
 def on_ticks(ws, ticks):
+    now = time.monotonic()
 
     for tick in ticks:
+        token = tick["instrument_token"]
+        price = tick["last_price"]
 
         config.live_ltp_dict[
-            tick["instrument_token"]
-        ] = tick["last_price"]
+            token
+        ] = price
+
+        price_cache[token] = {
+            "price": price,
+            "received_at": now,
+            "source": "websocket"
+        }
 
 
 def on_connect(ws, response):
@@ -80,6 +89,18 @@ def on_connect(ws, response):
             f"Subscribed {len(tokens)} tokens"
         )
 
+
+def on_close(ws, code, reason):
+    logger.warning(
+        f"SL Manager WebSocket closed. code={code}, reason={reason}"
+    )
+
+
+def on_error(ws, code, reason):
+    logger.error(
+        f"SL Manager WebSocket error. code={code}, reason={reason}"
+    )
+
 def get_open_positions():
     positions = kite.positions()
     return [p for p in positions["net"] if p["quantity"] != 0]
@@ -93,9 +114,65 @@ def get_sl_transaction_type(position):
     return "SELL" if get_position_side(position) == "LONG" else "BUY"
 
 
+def get_position_instrument(position):
+    return f"{position['exchange']}:{position['tradingsymbol']}"
+
+
+def get_cached_price(token, now):
+    cached = price_cache.get(token)
+
+    if not cached:
+        return None
+
+    if now - cached["received_at"] > config.PRICE_MAX_AGE_SECONDS:
+        return None
+
+    return cached["price"]
+
+
+def refresh_price_from_rest(position):
+    token = position["instrument_token"]
+    instrument = get_position_instrument(position)
+
+    try:
+        quotes = kite.ltp([instrument])
+    except Exception:
+        logger.exception(
+            f"Failed REST LTP refresh for {instrument}"
+        )
+        return None
+
+    quote = quotes.get(instrument)
+    if not quote or quote.get("last_price") is None:
+        logger.warning(
+            f"REST LTP missing for {instrument}"
+        )
+        return None
+
+    price = quote["last_price"]
+    config.live_ltp_dict[token] = price
+    price_cache[token] = {
+        "price": price,
+        "received_at": time.monotonic(),
+        "source": "rest"
+    }
+
+    return price
+
+
 def get_ltp(position):
     token = position["instrument_token"]
-    return config.live_ltp_dict.get(token, position["last_price"])
+    price = get_cached_price(token, time.monotonic())
+
+    if price is not None:
+        return price
+
+    logger.warning(
+        f"Missing/stale LTP for {get_position_instrument(position)}. "
+        "Trying REST LTP fallback."
+    )
+
+    return refresh_price_from_rest(position)
 
 
 def calculate_initial_trigger(position):
@@ -384,27 +461,64 @@ def handle_position_size_change(pos):
             f"{pos['tradingsymbol']}"
         )
 
-        cancel_order(tracked["sl_order_id"])
+        current_side = get_position_side(pos)
 
-        sl_order = place_SL_order(pos)
-        if not sl_order:
+        if current_side != tracked["side"]:
             logger.warning(
-                f"Unable to replace SL for {pos['tradingsymbol']} "
-                "after quantity change"
+                f"Position side changed for {pos['tradingsymbol']}. "
+                "Existing SL transaction type cannot be modified; replacing SL order."
             )
-            config.tracked_positions.pop(token, None)
+
+            cancel_order(tracked["sl_order_id"])
+
+            sl_order = place_SL_order(pos)
+            if not sl_order:
+                logger.warning(
+                    f"Unable to place replacement SL for {pos['tradingsymbol']} "
+                    "after side change"
+                )
+                config.tracked_positions.pop(token, None)
+                return
+
+            new_sl_order_id, trigger_price = sl_order
+
+            config.tracked_positions[token] = {
+                "quantity": pos["quantity"],
+                "entry_price": pos["average_price"],
+                "sl_order_id": new_sl_order_id,
+                "side": current_side,
+                "best_price": pos["average_price"],
+                "current_trigger": trigger_price
+            }
             return
 
-        new_sl_order_id, trigger_price = sl_order
+        try:
+            kite.modify_order(
+                variety="regular",
+                order_id=tracked["sl_order_id"],
+                quantity=abs(pos["quantity"]),
+                order_type="SL-M",
+                trigger_price=tracked["current_trigger"]
+            )
+        except Exception:
+            logger.exception(
+                f"Failed to modify SL quantity for {pos['tradingsymbol']}"
+            )
+            return
 
         config.tracked_positions[token] = {
             "quantity": pos["quantity"],
             "entry_price": pos["average_price"],
-            "sl_order_id": new_sl_order_id,
-            "side": get_position_side(pos),
+            "sl_order_id": tracked["sl_order_id"],
+            "side": tracked["side"],
             "best_price": tracked["best_price"],
-            "current_trigger": trigger_price
+            "current_trigger": tracked["current_trigger"]
         }
+
+        logger.info(
+            f"Modified SL quantity for {pos['tradingsymbol']} "
+            f"to {abs(pos['quantity'])}"
+        )
 
 def cleanup_closed_positions():
 
@@ -435,19 +549,18 @@ def cleanup_closed_positions():
             subscribed_tokens.discard(token)
 
 
-def run_manager(client_id):
+def run_manager():
     global kite
+    client_id = get_kite_client.get_single_client_id()
 
     logger.info(
         f"Starting SL manager for {client_id}"
     )
 
-    kite = get_kite_client.get_kite_client(client_id)
+    kite = get_kite_client.get_kite_client()
     time.sleep(2)
 
-    client_doc = get_kite_client.get_client_doc_from_json(
-        client_id
-    )
+    client_doc = get_kite_client.get_client_doc_from_json()
 
     config.kws = KiteTicker(
         client_doc["api_key"],
@@ -456,6 +569,8 @@ def run_manager(client_id):
 
     config.kws.on_ticks = on_ticks
     config.kws.on_connect = on_connect
+    config.kws.on_close = on_close
+    config.kws.on_error = on_error
 
     config.kws.connect(threaded=True)
     time.sleep(2)
@@ -501,48 +616,15 @@ def run_manager(client_id):
         time.sleep(2)
 
 
-def load_credentials():
-    json_file = os.path.join(current_file_path, "credentials.json")
-    with open(json_file) as f:
-        return json.load(f)
-
-
-def run_all_clients():
-    credentials = load_credentials()
-
+def main():
     if len(sys.argv) > 1:
-        client_id = sys.argv[1]
-        if client_id not in credentials:
-            logger.error(
-                f"Unknown client id for SL manager: {client_id}"
-            )
-            sys.exit(1)
-        run_manager(client_id)
-        return
-
-    client_ids = list(credentials.keys())
-
-    if len(client_ids) == 1:
-        run_manager(client_ids[0])
-        return
-
-    processes = []
-    for client_id in client_ids:
-        processes.append(
-            subprocess.Popen(
-                [sys.executable, __file__, client_id],
-                start_new_session=True
-            )
+        logger.error(
+            "SL manager runs in single-client mode and does not accept a client id argument."
         )
+        sys.exit(1)
 
-    try:
-        for process in processes:
-            process.wait()
-    except KeyboardInterrupt:
-        for process in processes:
-            process.terminate()
-        raise
+    run_manager()
 
 
 if __name__ == "__main__":
-    run_all_clients()
+    main()

@@ -1,25 +1,15 @@
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-import json
 import traceback
 import mintotp
-import os
 import time
 import sys
+import get_kite_client
 
 
-current_file_path = os.path.dirname(os.path.realpath(__file__))
-
-
-def load_credentials():
-    json_file = os.path.join(current_file_path, "credentials.json")
-    with open(json_file) as f:
-        return json.load(f)
-
-
-def get_client_doc_from_json(client_id):
+def get_client_doc_from_json(client_id=None):
     try:
-        return load_credentials()[client_id]
+        return get_kite_client.get_client_doc_from_json(client_id)
     except Exception:
         traceback.print_exc()
 
@@ -106,7 +96,14 @@ def disable_segment(client_id, driver):
         traceback.print_exc()
 
 
-def main(client_id):
+def main():
+    if len(sys.argv) > 1:
+        print(
+            "Kill switch runs in single-client mode and does not accept a client id argument."
+        )
+        sys.exit(1)
+
+    client_id = get_kite_client.get_single_client_id()
     driver = create_driver()
     try:
         disable_segment(client_id, driver)
@@ -114,12 +111,5 @@ def main(client_id):
         driver.quit()
 
 
-def run_all_clients():
-    credentials = load_credentials()
-
-    for client_id in credentials.keys():
-        main(client_id)
-
-
 if __name__ == "__main__":
-    run_all_clients()
+    main()

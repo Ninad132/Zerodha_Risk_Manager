@@ -1,31 +1,31 @@
 import json
 from kiteconnect import KiteConnect
-from flask import Flask, request, session, redirect
+from flask import Flask, request, redirect
 from dotenv import load_dotenv
 import os
 import traceback
 import subprocess
 import sys
+import fcntl
+import get_kite_client
 
 RISK_MANAGER_PID_FILE = "risk_manager.pid"
 
 
-def load_credentials():
-    json_file = os.path.join(current_file_path, "credentials.json")
-    with open(json_file) as f:
-        return json.load(f)
+def get_client_id():
+    return get_kite_client.get_single_client_id()
 
 
-def get_client_doc_from_json(client_id):
+def get_client_doc_from_json():
     try:
-        return load_credentials()[client_id]
+        return get_kite_client.get_client_doc_from_json()
     except Exception:
         traceback.print_exc()
 
 def save_access_token(
-    client_id,
     access_token
 ):
+    client_id = get_client_id()
 
     json_file = os.path.join(
         current_file_path,
@@ -45,14 +45,6 @@ def save_access_token(
         )
 
 
-def all_clients_have_access_tokens():
-    credentials = load_credentials()
-    return all(
-        bool(client_doc.get("access_token"))
-        for client_doc in credentials.values()
-    )
-
-
 def is_process_running(pid):
     try:
         os.kill(pid, 0)
@@ -61,40 +53,62 @@ def is_process_running(pid):
         return False
 
 
+def read_running_pid(pid_file):
+    if not os.path.exists(pid_file):
+        return None
+
+    with open(pid_file) as f:
+        pid_text = f.read().strip()
+
+    if not pid_text:
+        return None
+
+    try:
+        pid = int(pid_text)
+    except ValueError:
+        return None
+
+    if is_process_running(pid):
+        return pid
+
+    return None
+
+
 def start_risk_manager_if_needed():
     pid_file = os.path.join(
         current_file_path,
         RISK_MANAGER_PID_FILE
     )
+    lock_file = f"{pid_file}.lock"
 
-    if os.path.exists(pid_file):
-        with open(pid_file) as f:
-            pid_text = f.read().strip()
+    with open(lock_file, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
 
-        if pid_text and is_process_running(int(pid_text)):
-            return int(pid_text), False
+        running_pid = read_running_pid(pid_file)
+        if running_pid:
+            return running_pid, False
 
-    risk_manager_path = os.path.join(
-        current_file_path,
-        "positions_kill_switch.py"
-    )
+        risk_manager_path = os.path.join(
+            current_file_path,
+            "positions_kill_switch.py"
+        )
 
-    log_file = open(
-        os.path.join(current_file_path, "risk_manager.log"),
-        "a"
-    )
+        log_file = open(
+            os.path.join(current_file_path, "risk_manager.log"),
+            "a"
+        )
 
-    process = subprocess.Popen(
-        [sys.executable, risk_manager_path],
-        stdout=log_file,
-        stderr=log_file,
-        start_new_session=True
-    )
+        process = subprocess.Popen(
+            [sys.executable, risk_manager_path],
+            stdout=log_file,
+            stderr=log_file,
+            start_new_session=True
+        )
 
-    with open(pid_file, "w") as f:
-        f.write(str(process.pid))
+        with open(pid_file, "w") as f:
+            f.write(str(process.pid))
 
-    return process.pid, True
+        return process.pid, True
 
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
@@ -107,16 +121,7 @@ app.secret_key = os.environ.get(
 
 @app.route("/")
 def index():
-    credentials = load_credentials()
-    client_links = "\n".join(
-        f"""
-        <a href="/login/{client_id}" class="client-row">
-            <span>{client_id}</span>
-            <strong>Login</strong>
-        </a>
-        """
-        for client_id in credentials.keys()
-    )
+    client_id = get_client_id()
 
     return f"""
     <!DOCTYPE html>
@@ -169,7 +174,7 @@ def index():
                 padding: 8px;
             }}
 
-            .client-row {{
+            .login-link {{
                 display: flex;
                 justify-content: space-between;
                 align-items: center;
@@ -179,7 +184,7 @@ def index():
                 text-decoration: none;
             }}
 
-            .client-row:hover {{
+            .login-link:hover {{
                 background: #f0f4f8;
             }}
 
@@ -193,10 +198,13 @@ def index():
         <main class="panel">
             <section class="header">
                 <h1>Zerodha Risk Manager</h1>
-                <p>Select each client once to refresh its Kite access token. The risk engine starts for all configured clients after every client has an access token.</p>
+                <p>Refresh the Kite access token for the configured account. The risk engine starts after login succeeds.</p>
             </section>
             <section class="list">
-                {client_links}
+                <a href="/login" class="login-link">
+                    <span>{client_id}</span>
+                    <strong>Login</strong>
+                </a>
             </section>
         </main>
     </body>
@@ -204,13 +212,12 @@ def index():
     """
 
 
-@app.route("/login/<client_id>")
-def login(client_id):
-    user_doc = get_client_doc_from_json(client_id)
+@app.route("/login")
+def login():
+    user_doc = get_client_doc_from_json()
     api_key = user_doc["api_key"]
 
     kite = KiteConnect(api_key=api_key)
-    session["client_id"] = client_id
 
     return redirect(kite.login_url())
 
@@ -218,33 +225,23 @@ def login(client_id):
 @app.route("/callback")
 def callback():
     request_token = request.args.get("request_token")
-    client_id = session.get("client_id")
+    client_id = get_client_id()
 
-    if not client_id:
-        return "Missing client session. Start again from /.", 400
-
-    user_doc = get_client_doc_from_json(client_id)
+    user_doc = get_client_doc_from_json()
     kite = KiteConnect(api_key=user_doc["api_key"])
     api_secret = user_doc["secret_key"]
     data = kite.generate_session(request_token, api_secret=api_secret)
     access_token = data["access_token"]
     save_access_token(
-        client_id,
         access_token
     )
-
-    if not all_clients_have_access_tokens():
-        return (
-            f"Login successful for {client_id}. "
-            "Refresh the remaining client access tokens from / before starting the risk manager."
-        )
 
     pid, started = start_risk_manager_if_needed()
     status = "started" if started else "already running"
 
     return (
         f"Login successful for {client_id}. "
-        f"Risk manager {status} for all configured clients. pid={pid}"
+        f"Risk manager {status}. pid={pid}"
     )
 
 
