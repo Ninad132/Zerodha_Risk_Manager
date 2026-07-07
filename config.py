@@ -11,7 +11,10 @@ kite=None
 kws = None
 # Dictionary to store our current position states
 open_positions = {}
-SL_PERCENT =5
+SL_PERCENT =7
 tracked_positions = {}
 live_ltp_dict = {}
-TRAILING_SL_PERCENT = 6
+TRAILING_SL_PERCENT = 7
+TRAILING_ACTIVATION_PERCENT = 7
+TRAILING_PROFIT_RETENTION_PERCENT = 50
+BREAKEVEN_PROFIT_BUFFER_PERCENT = 0.1

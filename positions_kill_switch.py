@@ -714,7 +714,7 @@ def is_trading_allowed():
 def ensure_daily_threshold(kite,opening_balance):
 
     daily_loss_limit = round(
-        opening_balance * 0.07,
+        opening_balance * 0.13,
     )
 
     logger.info(

@@ -118,6 +118,159 @@ def get_position_instrument(position):
     return f"{position['exchange']}:{position['tradingsymbol']}"
 
 
+def get_trade_timestamp(trade):
+    timestamp = (
+        trade.get("fill_timestamp")
+        or trade.get("exchange_timestamp")
+        or trade.get("order_timestamp")
+        or trade.get("trade_timestamp")
+        or ""
+    )
+
+    return str(timestamp)
+
+
+def trade_matches_position(trade, position):
+    return (
+        trade.get("exchange") == position["exchange"]
+        and trade.get("tradingsymbol") == position["tradingsymbol"]
+        and trade.get("product") == position["product"]
+    )
+
+
+def get_trade_price(trade):
+    price = (
+        trade.get("average_price")
+        or trade.get("price")
+    )
+
+    if price is None:
+        return None
+
+    try:
+        return float(price)
+    except (TypeError, ValueError):
+        return None
+
+
+def get_trade_signed_quantity(trade):
+    quantity = trade.get("quantity")
+
+    if quantity is None:
+        quantity = trade.get("filled_quantity")
+
+    if not quantity:
+        return 0
+
+    transaction_type = trade.get("transaction_type")
+    if transaction_type == "BUY":
+        sign = 1
+    elif transaction_type == "SELL":
+        sign = -1
+    else:
+        return 0
+
+    return sign * abs(int(quantity))
+
+
+def calculate_active_leg_average_price(trades):
+    signed_quantity = 0
+    average_price = 0
+
+    for trade in trades:
+        trade_quantity = get_trade_signed_quantity(trade)
+        trade_price = get_trade_price(trade)
+
+        if trade_quantity == 0 or trade_price is None:
+            continue
+
+        if signed_quantity == 0:
+            signed_quantity = trade_quantity
+            average_price = trade_price
+            continue
+
+        same_side = (
+            signed_quantity > 0 and trade_quantity > 0
+        ) or (
+            signed_quantity < 0 and trade_quantity < 0
+        )
+
+        if same_side:
+            current_quantity = abs(signed_quantity)
+            added_quantity = abs(trade_quantity)
+            total_quantity = current_quantity + added_quantity
+            average_price = (
+                (average_price * current_quantity)
+                + (trade_price * added_quantity)
+            ) / total_quantity
+            signed_quantity += trade_quantity
+            continue
+
+        if abs(trade_quantity) < abs(signed_quantity):
+            signed_quantity += trade_quantity
+        elif abs(trade_quantity) == abs(signed_quantity):
+            signed_quantity = 0
+            average_price = 0
+        else:
+            remaining_quantity = abs(trade_quantity) - abs(signed_quantity)
+            signed_quantity = (
+                remaining_quantity
+                if trade_quantity > 0
+                else -remaining_quantity
+            )
+            average_price = trade_price
+
+    return signed_quantity, average_price
+
+
+def get_active_leg_entry_price(position):
+    try:
+        trades = kite.trades()
+    except Exception:
+        logger.exception(
+            f"Failed to fetch trades for {position['tradingsymbol']}. "
+            "Falling back to Kite position average."
+        )
+        return None
+
+    matching_trades = [
+        trade
+        for trade in trades
+        if trade_matches_position(trade, position)
+    ]
+
+    if not matching_trades:
+        return None
+
+    matching_trades.sort(key=get_trade_timestamp)
+    signed_quantity, entry_price = calculate_active_leg_average_price(
+        matching_trades
+    )
+
+    if signed_quantity != position["quantity"]:
+        logger.warning(
+            f"Trade reconstruction quantity mismatch for "
+            f"{position['tradingsymbol']}. "
+            f"trades_qty={signed_quantity}, position_qty={position['quantity']}. "
+            "Falling back to Kite position average."
+        )
+        return None
+
+    if entry_price <= 0:
+        return None
+
+    return entry_price
+
+
+def get_position_entry_price(position):
+    entry_price = get_active_leg_entry_price(position)
+
+    if entry_price is not None:
+        return entry_price
+
+    return position["average_price"]
+
+
 def get_cached_price(token, now):
     cached = price_cache.get(token)
 
@@ -175,9 +328,7 @@ def get_ltp(position):
     return refresh_price_from_rest(position)
 
 
-def calculate_initial_trigger(position):
-    entry_price = position["average_price"]
-
+def calculate_initial_trigger(position, entry_price):
     if get_position_side(position) == "LONG":
         return round(entry_price * (1 - config.SL_PERCENT / 100), 1)
 
@@ -189,6 +340,93 @@ def is_valid_trigger(position, trigger_price, ltp):
         return trigger_price < ltp
 
     return trigger_price > ltp
+
+
+def get_config_number(name, default):
+    return getattr(config, name, default)
+
+
+def calculate_favorable_move_percent(side, entry_price, best_price):
+    if entry_price <= 0:
+        return 0
+
+    if side == "LONG":
+        return ((best_price - entry_price) / entry_price) * 100
+
+    return ((entry_price - best_price) / entry_price) * 100
+
+
+def calculate_fixed_trailing_trigger(side, best_price):
+    trailing_percent = get_config_number(
+        "TRAILING_SL_PERCENT",
+        config.SL_PERCENT
+    )
+
+    if side == "LONG":
+        return round(best_price * (1 - trailing_percent / 100), 1)
+
+    return round(best_price * (1 + trailing_percent / 100), 1)
+
+
+def calculate_profit_lock_trigger(side, entry_price, best_price):
+    activation_percent = get_config_number(
+        "TRAILING_ACTIVATION_PERCENT",
+        config.TRAILING_SL_PERCENT
+    )
+    favorable_move = calculate_favorable_move_percent(
+        side,
+        entry_price,
+        best_price
+    )
+
+    if favorable_move < activation_percent:
+        return None
+
+    retention_percent = get_config_number(
+        "TRAILING_PROFIT_RETENTION_PERCENT",
+        0
+    )
+    retention_ratio = max(0, min(retention_percent, 100)) / 100
+    breakeven_buffer_percent = get_config_number(
+        "BREAKEVEN_PROFIT_BUFFER_PERCENT",
+        0
+    )
+
+    if side == "LONG":
+        retained_profit_trigger = entry_price + (
+            (best_price - entry_price) * retention_ratio
+        )
+        breakeven_trigger = entry_price * (
+            1 + breakeven_buffer_percent / 100
+        )
+        return round(max(retained_profit_trigger, breakeven_trigger), 1)
+
+    retained_profit_trigger = entry_price - (
+        (entry_price - best_price) * retention_ratio
+    )
+    breakeven_trigger = entry_price * (
+        1 - breakeven_buffer_percent / 100
+    )
+    return round(min(retained_profit_trigger, breakeven_trigger), 1)
+
+
+def calculate_trailing_trigger(tracked, best_price):
+    side = tracked["side"]
+    entry_price = tracked["entry_price"]
+    fixed_trigger = calculate_fixed_trailing_trigger(side, best_price)
+    profit_lock_trigger = calculate_profit_lock_trigger(
+        side,
+        entry_price,
+        best_price
+    )
+
+    if profit_lock_trigger is None:
+        return fixed_trigger
+
+    if side == "LONG":
+        return max(fixed_trigger, profit_lock_trigger)
+
+    return min(fixed_trigger, profit_lock_trigger)
 
 def sync_subscriptions(positions):
     global subscribed_tokens
@@ -225,13 +463,15 @@ def sync_subscriptions(positions):
 
 def place_SL_order(position):
     token = position["instrument_token"]
-    trigger_price = calculate_initial_trigger(position)
+    entry_price = get_position_entry_price(position)
+    trigger_price = calculate_initial_trigger(position, entry_price)
     ltp = get_ltp(position)
 
     if ltp is None or not is_valid_trigger(position, trigger_price, ltp):
 
         logger.warning(f"""Cannot place SL
         Token   : {token}
+        Entry   : {entry_price}
         Trigger : {trigger_price}
         LTP     : {ltp}
         """
@@ -251,9 +491,9 @@ def place_SL_order(position):
     
     logger.info(
         f"SL placed for {position['tradingsymbol']} "
-        f"at {trigger_price}"
+        f"at {trigger_price} using entry {entry_price}"
     )
-    return order_id, trigger_price
+    return order_id, trigger_price, ltp, entry_price
 
 
 def is_active_sl_order(order):
@@ -284,12 +524,19 @@ def get_order_created_at(order):
 def track_position_from_order(position, order):
     token = position["instrument_token"]
     current_price = get_ltp(position)
-    entry_price = position["average_price"]
+    entry_price = get_position_entry_price(position)
+
+    if current_price is None:
+        logger.warning(
+            f"Skipping tracking for existing SL order {order['order_id']} "
+            f"on {position['tradingsymbol']}: fresh LTP unavailable."
+        )
+        return False
 
     if get_position_side(position) == "LONG":
-        best_price = max(entry_price, current_price or entry_price)
+        best_price = max(entry_price, current_price)
     else:
-        best_price = min(entry_price, current_price or entry_price)
+        best_price = min(entry_price, current_price)
 
     config.tracked_positions[token] = {
         "quantity": position["quantity"],
@@ -299,6 +546,7 @@ def track_position_from_order(position, order):
         "best_price": best_price,
         "current_trigger": float(order["trigger_price"])
     }
+    return True
 
 
 def reconcile_existing_sl_orders(positions):
@@ -337,7 +585,8 @@ def reconcile_existing_sl_orders(positions):
             continue
 
         order_to_track = exact_orders[0]
-        track_position_from_order(position, order_to_track)
+        if not track_position_from_order(position, order_to_track):
+            continue
 
         for duplicate_order in matching_orders:
             if duplicate_order["order_id"] != order_to_track["order_id"]:
@@ -367,55 +616,63 @@ def trail_stop_loss(pos):
 
     if tracked["side"] == "LONG":
         is_new_best_price = current_price > tracked["best_price"]
-        new_trigger = round(
-            current_price *
-            (1 - config.TRAILING_SL_PERCENT / 100),
-            1
-        )
-        should_modify = new_trigger > tracked["current_trigger"]
     else:
         is_new_best_price = current_price < tracked["best_price"]
-        new_trigger = round(
-            current_price *
-            (1 + config.TRAILING_SL_PERCENT / 100),
-            1
-        )
-        should_modify = new_trigger < tracked["current_trigger"]
 
     if not is_new_best_price:
         return
 
-    tracked["best_price"] = current_price
+    new_trigger = calculate_trailing_trigger(
+        tracked,
+        current_price
+    )
 
-    if should_modify:
-
-        logger.info(
-            f"{pos['tradingsymbol']} | "
+    if not is_valid_trigger(pos, new_trigger, current_price):
+        logger.warning(
+            f"Skipping invalid trailing SL for {pos['tradingsymbol']}. "
             f"Best={current_price} | "
-            f"Old SL={tracked['current_trigger']} | "
+            f"Current SL={tracked['current_trigger']} | "
             f"New SL={new_trigger}"
         )
+        return
 
-        try:
+    if tracked["side"] == "LONG":
+        should_modify = new_trigger > tracked["current_trigger"]
+    else:
+        should_modify = new_trigger < tracked["current_trigger"]
 
-            kite.modify_order(
-                variety="regular",
-                order_id=tracked["sl_order_id"],
-                trigger_price=new_trigger
-            )
+    if not should_modify:
+        tracked["best_price"] = current_price
+        return
+
+    logger.info(
+        f"{pos['tradingsymbol']} | "
+        f"Best={current_price} | "
+        f"Old SL={tracked['current_trigger']} | "
+        f"New SL={new_trigger}"
+    )
+
+    try:
+
+        kite.modify_order(
+            variety="regular",
+            order_id=tracked["sl_order_id"],
+            trigger_price=new_trigger
+        )
 
 
-            tracked["current_trigger"] = new_trigger
-            logger.info(
-                f"Modified SL to {new_trigger}"
-            )
+        tracked["best_price"] = current_price
+        tracked["current_trigger"] = new_trigger
+        logger.info(
+            f"Modified SL to {new_trigger}"
+        )
 
-        except Exception:
+    except Exception:
 
-            logger.exception(
-                f"Failed trailing SL for "
-                f"{pos['tradingsymbol']}"
-            )
+        logger.exception(
+            f"Failed trailing SL for "
+            f"{pos['tradingsymbol']}"
+        )
 
 def monitor_new_positions(positions):
     for pos in positions:
@@ -426,14 +683,14 @@ def monitor_new_positions(positions):
 
             sl_order = place_SL_order(pos)
             if sl_order:
-                sl_order_id, trigger_price = sl_order
+                sl_order_id, trigger_price, ltp, entry_price = sl_order
 
                 config.tracked_positions[token] = {
                     "quantity": pos["quantity"],
-                    "entry_price": pos["average_price"],
+                    "entry_price": entry_price,
                     "sl_order_id": sl_order_id,
                     "side": get_position_side(pos),
-                    "best_price": pos["average_price"],
+                    "best_price": ltp,
                     "current_trigger": trigger_price
                 }
 
@@ -480,14 +737,14 @@ def handle_position_size_change(pos):
                 config.tracked_positions.pop(token, None)
                 return
 
-            new_sl_order_id, trigger_price = sl_order
+            new_sl_order_id, trigger_price, ltp, entry_price = sl_order
 
             config.tracked_positions[token] = {
                 "quantity": pos["quantity"],
-                "entry_price": pos["average_price"],
+                "entry_price": entry_price,
                 "sl_order_id": new_sl_order_id,
                 "side": current_side,
-                "best_price": pos["average_price"],
+                "best_price": ltp,
                 "current_trigger": trigger_price
             }
             return
@@ -508,7 +765,7 @@ def handle_position_size_change(pos):
 
         config.tracked_positions[token] = {
             "quantity": pos["quantity"],
-            "entry_price": pos["average_price"],
+            "entry_price": get_position_entry_price(pos),
             "sl_order_id": tracked["sl_order_id"],
             "side": tracked["side"],
             "best_price": tracked["best_price"],
