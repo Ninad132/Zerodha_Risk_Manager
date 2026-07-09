@@ -51,6 +51,11 @@ RISK_MANAGER_LOCK_FILE = os.path.join(
     "risk_manager.lock"
 )
 
+NO_NEW_TRADES_START = dt.time(10, 45)
+NO_NEW_TRADES_END = dt.time(12, 45)
+NO_NEW_TRADES_REASON = "No New Trades Between 10:45 AM and 12:45 PM"
+CAPITAL_USAGE_REASON = "Capital Usage Limit Exceeded"
+
 
 class StaleMarketDataError(Exception):
     pass
@@ -575,6 +580,10 @@ def check_kill_condition(kite,positions):
 def cancel_all_orders(kite):
 
     orders = kite.orders()
+    cancel_orders(kite, orders)
+
+
+def cancel_orders(kite, orders):
 
     for order in orders:
 
@@ -603,12 +612,12 @@ def cancel_all_orders(kite):
             )
 
 
-def exit_all_positions(kite):
-    # print("Exiting all positions...")
+def exit_positions(kite, positions_to_exit):
     try:
-        positions = kite.positions()
         open_positions = [
-            position for position in positions["net"] if position["quantity"] != 0
+            position
+            for position in positions_to_exit
+            if position["quantity"] != 0
         ]
         for position in open_positions:
             transaction_type = "SELL" if position["quantity"] > 0 else "BUY"
@@ -627,6 +636,12 @@ def exit_all_positions(kite):
         logger.error(f"Error exiting positions: {traceback.format_exc()}")
 
 
+def exit_all_positions(kite):
+    # print("Exiting all positions...")
+    positions = kite.positions()
+    exit_positions(kite, positions["net"])
+
+
 def get_active_orders(kite):
     inactive_statuses = {
         "COMPLETE",
@@ -639,6 +654,292 @@ def get_active_orders(kite):
         for order in kite.orders()
         if order["status"] not in inactive_statuses
     ]
+
+
+def is_no_new_trades_window(now=None):
+    if now is None:
+        now = dt.datetime.now(ist)
+
+    current_time = now.time()
+    return (
+        NO_NEW_TRADES_START <= current_time < NO_NEW_TRADES_END
+    )
+
+
+def parse_order_timestamp(timestamp):
+    if timestamp is None:
+        return None
+
+    if isinstance(timestamp, dt.datetime):
+        if timestamp.tzinfo is None:
+            return ist.localize(timestamp)
+        return timestamp.astimezone(ist)
+
+    if isinstance(timestamp, str):
+        for timestamp_format in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%Y-%m-%dT%H:%M:%S.%f%z"
+        ):
+            try:
+                parsed = dt.datetime.strptime(
+                    timestamp,
+                    timestamp_format
+                )
+                if parsed.tzinfo is None:
+                    return ist.localize(parsed)
+                return parsed.astimezone(ist)
+            except ValueError:
+                continue
+
+    return None
+
+
+def get_order_timestamps(order):
+    timestamps = []
+
+    for field in (
+        "exchange_timestamp",
+        "order_timestamp",
+        "exchange_update_timestamp",
+        "created_at"
+    ):
+        timestamp = parse_order_timestamp(order.get(field))
+        if timestamp is not None:
+            timestamps.append(timestamp)
+
+    return timestamps
+
+
+def is_order_from_no_new_trades_window(order):
+    if order.get("status") != "COMPLETE":
+        return False
+
+    timestamps = get_order_timestamps(order)
+    if not timestamps:
+        logger.warning(
+            f"Cannot determine timestamp for order {order.get('order_id')}"
+        )
+        return False
+
+    return any(
+        is_no_new_trades_window(timestamp)
+        for timestamp in timestamps
+    )
+
+
+def get_position_key(item):
+    return (
+        item.get("exchange"),
+        item.get("tradingsymbol"),
+        item.get("product")
+    )
+
+
+def is_entry_order_for_position(order, position):
+    if get_position_key(order) != get_position_key(position):
+        return False
+
+    if position["quantity"] > 0:
+        return order.get("transaction_type") == "BUY"
+
+    if position["quantity"] < 0:
+        return order.get("transaction_type") == "SELL"
+
+    return False
+
+
+def is_active_order(order):
+    return order["status"] not in {
+        "COMPLETE",
+        "CANCELLED",
+        "REJECTED"
+    }
+
+
+def is_active_new_trade_order(order, positions_by_key):
+    if not is_active_order(order):
+        return False
+
+    position = positions_by_key.get(get_position_key(order))
+
+    if not position or position["quantity"] == 0:
+        return True
+
+    return is_entry_order_for_position(order, position)
+
+
+def get_positions_opened_in_no_new_trades_window(orders, positions):
+    blocked_entry_orders = [
+        order
+        for order in orders
+        if is_order_from_no_new_trades_window(order)
+    ]
+
+    return [
+        position
+        for position in positions
+        if position["quantity"] != 0
+        and any(
+            is_entry_order_for_position(order, position)
+            for order in blocked_entry_orders
+        )
+    ]
+
+
+def enforce_no_new_trades_window(positions, client_id=""):
+    current_window = is_no_new_trades_window()
+    orders = kite.orders()
+    positions_by_key = {
+        get_position_key(position): position
+        for position in positions
+        if position["quantity"] != 0
+    }
+    active_new_trade_orders = [
+        order
+        for order in orders
+        if current_window
+        and is_active_new_trade_order(order, positions_by_key)
+    ]
+    positions_to_exit = get_positions_opened_in_no_new_trades_window(
+        orders,
+        positions
+    )
+
+    if not active_new_trade_orders and not positions_to_exit:
+        return
+
+    logger.warning(
+        f"{NO_NEW_TRADES_REASON}: "
+        f"active_new_trade_orders={len(active_new_trade_orders)}, "
+        f"positions_to_exit={len(positions_to_exit)}"
+    )
+    log_journal(
+        event="RULE_TRIGGER",
+        client_id=client_id,
+        open_positions=len(positions_to_exit),
+        reason=NO_NEW_TRADES_REASON
+    )
+
+    cancel_orders(kite, active_new_trade_orders)
+    exit_positions(kite, positions_to_exit)
+
+
+def get_position_capital_used(position):
+    quantity = abs(position.get("quantity", 0))
+    price = position.get("average_price") or 0
+    multiplier = position.get("multiplier") or 1
+
+    return quantity * price * multiplier
+
+
+def get_order_price_for_capital_check(order):
+    for field in (
+        "average_price",
+        "price",
+        "trigger_price"
+    ):
+        price = order.get(field)
+        if price:
+            return price
+
+    return None
+
+
+def get_order_capital_required(order):
+    price = get_order_price_for_capital_check(order)
+    if price is None:
+        return None
+
+    quantity = (
+        order.get("pending_quantity")
+        or order.get("quantity")
+        or 0
+    )
+    return abs(quantity) * price
+
+
+def get_open_capital_used(positions):
+    return sum(
+        get_position_capital_used(position)
+        for position in positions
+        if position["quantity"] != 0
+    )
+
+
+def get_capital_limit(opening_balance):
+    return opening_balance * config.MAX_CAPITAL_USAGE_FRACTION
+
+
+def get_orders_breaching_capital_limit(
+    orders,
+    positions,
+    capital_limit
+):
+    projected_capital_used = get_open_capital_used(positions)
+    positions_by_key = {
+        get_position_key(position): position
+        for position in positions
+        if position["quantity"] != 0
+    }
+    breaching_orders = []
+
+    for order in orders:
+        if not is_active_new_trade_order(order, positions_by_key):
+            continue
+
+        order_capital_required = get_order_capital_required(order)
+        if order_capital_required is None:
+            breaching_orders.append(order)
+            continue
+
+        if projected_capital_used + order_capital_required > capital_limit:
+            breaching_orders.append(order)
+            continue
+
+        projected_capital_used += order_capital_required
+
+    return breaching_orders
+
+
+def enforce_capital_usage_limit(
+    positions,
+    opening_balance,
+    client_id=""
+):
+    capital_limit = get_capital_limit(opening_balance)
+    open_capital_used = get_open_capital_used(positions)
+    orders = kite.orders()
+    breaching_orders = get_orders_breaching_capital_limit(
+        orders,
+        positions,
+        capital_limit
+    )
+    positions_to_exit = [
+        position
+        for position in positions
+        if position["quantity"] != 0
+    ] if open_capital_used > capital_limit else []
+
+    if not breaching_orders and not positions_to_exit:
+        return
+
+    logger.warning(
+        f"{CAPITAL_USAGE_REASON}: "
+        f"open_capital_used={open_capital_used}, "
+        f"capital_limit={capital_limit}, "
+        f"breaching_orders={len(breaching_orders)}, "
+        f"positions_to_exit={len(positions_to_exit)}"
+    )
+    log_journal(
+        event="RULE_TRIGGER",
+        client_id=client_id,
+        open_positions=len(positions_to_exit),
+        reason=CAPITAL_USAGE_REASON
+    )
+
+    cancel_orders(kite, breaching_orders)
+    exit_positions(kite, positions_to_exit)
 
 
 def enforce_lockdown_clear(client_id=""):
@@ -802,6 +1103,13 @@ def run_engine():
                 continue
 
             try:
+                enforce_no_new_trades_window(positions, client_id)
+                enforce_capital_usage_limit(
+                    positions,
+                    opening_balance,
+                    client_id
+                )
+
                 MTM, order_len, open_orders = check_kill_condition(kite,positions)
                 update_peak_mtm(MTM)
 

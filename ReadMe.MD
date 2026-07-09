@@ -38,7 +38,9 @@ This project runs in single-client mode. `credentials.json` must contain exactly
 2. The script will check if you have any open positions.
 3. Then the script will check if the total loss is above threshold.
 4. If the loss is above threshold, the script will close positions, cancel all orders and activate the kill switch.
-5. The script will wait for a specified time before checking again.
+5. Between 10:45 AM and 12:45 PM IST, the script will cancel active orders and close positions opened during that restricted window.
+6. The script limits deployed capital to 20% of the opening balance by cancelling oversized new-entry orders and closing positions if open capital is already above the cap.
+7. The script will wait for a specified time before checking again.
 
 ## Alt Usage
 1. You can also directly run the `kill_switch.py` script to manually activate the kill switch.
