@@ -1,0 +1,86 @@
+Option Buying Strategy Research Notes
+Date: 2026-07-09
+
+Candidate strategy:
+NIFTY intraday momentum debit-spread strategy.
+
+This is a net option-buying strategy, but not naked ATM option buying. It uses
+a long debit spread so risk is defined and theta/IV damage is partly offset by
+the short OTM option leg.
+
+Why this is preferred:
+- Retail F&O trading has poor aggregate outcomes. SEBI data reported that
+  around 91% of individual equity-derivatives traders lost money in FY25.
+- Intraday momentum, opening-range breakout, and VWAP-based systems have
+  published research support on liquid US ETFs. This does not prove NIFTY
+  profitability, but it gives a defensible starting framework for backtesting.
+- NIFTY options are liquid and are better suited for automation than many
+  single-stock options.
+
+Useful sources:
+- SEBI summary via Economic Times:
+  https://economictimes.indiatimes.com/markets/stocks/news/91-of-individual-fo-traders-lost-money-in-fy25-despite-sebi-curbs-study/articleshow/122302956.cms
+- Opening Range Breakout paper:
+  https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4416622
+- VWAP day trading paper:
+  https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4631351
+- Intraday momentum paper:
+  https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4824172
+- NSE contract specifications:
+  https://www.nseindia.com/products-services/equity-derivatives-contract-specifications
+
+Core rules:
+1. Use 5-minute NIFTY spot or futures candles.
+2. Trade only between 09:30 and 14:15.
+3. No fresh trades after 14:15.
+4. Force exit by 15:10.
+5. Build opening range from 09:15 to 09:30.
+6. Calculate VWAP from market open.
+7. Calculate 14-period ATR on 5-minute NIFTY candles.
+8. Trade only if opening range size is reasonable:
+   - opening range > 0.25 * daily ATR
+   - opening range < 0.9 * daily ATR
+
+Long call debit spread entry:
+- NIFTY 5-minute candle closes above opening-range high.
+- Close is above VWAP.
+- VWAP slope is positive over last 3 candles.
+- RSI 14 is above 55.
+- Buy ATM or slightly ITM CE, around 0.50-0.60 delta.
+- Sell OTM CE around 0.25-0.35 delta.
+
+Long put debit spread entry:
+- NIFTY 5-minute candle closes below opening-range low.
+- Close is below VWAP.
+- VWAP slope is negative over last 3 candles.
+- RSI 14 is below 45.
+- Buy ATM or slightly ITM PE, around 0.50-0.60 delta.
+- Sell OTM PE around 0.25-0.35 delta.
+
+Exit rules:
+- Stop loss: 35% of debit paid.
+- Book 50% quantity at 45-50% profit on debit.
+- Trail the rest using NIFTY structure, not option premium alone.
+- Exit fully if NIFTY closes back inside the opening range.
+- Exit fully if NIFTY closes on the opposite side of VWAP.
+- Time stop: exit if trade does not move in favor within 30 minutes.
+
+Risk rules:
+- Max 1 trade per direction per day.
+- Max 2 trades per day.
+- Risk per trade: 0.5% to 1% of capital.
+- Daily max loss: 1.5% to 2.5% of capital.
+- Stop trading after 2 consecutive losses.
+
+Backtest acceptance criteria:
+- Minimum 300 trades.
+- Win rate above 52%.
+- Profit factor above 1.25.
+- Average winner at least 0.9x average loser.
+- Include brokerage, STT, slippage, and bid-ask spread.
+- Test across different volatility and trend regimes.
+
+Important:
+Do not assume a greater-than-50% win rate before backtesting. The strategy is
+designed to target that profile, but it must be validated on Indian market data
+before live order placement.

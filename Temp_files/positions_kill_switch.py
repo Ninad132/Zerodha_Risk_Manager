@@ -578,7 +578,7 @@ def ensure_daily_threshold(kite,opening_balance):
     )
 
     daily_loss_limit = round(
-        opening_balance * 0.07,
+        opening_balance * 0.13,
     )
 
     logger.info(
@@ -689,7 +689,7 @@ def run_engine():
                         activate_lockdown("Max Open Positions Limit Exceeded")
 
                     #Rule 3: Daily Loss Limit or max orders limit. This is to protect the capital. If the loss is more than 5% of the opening balance, then we can stop for the day and protect the capital.
-                    if MTM <= -loss_threshold or order_len >= 12:
+                    if MTM <= -loss_threshold or order_len >= 20:
                         log_journal(event="RULE_TRIGGER",mtm=MTM,peak_mtm=config.PEAK_MTM,orders=order_len,open_positions=open_orders,reason="Daily Loss Limit Exceeded or Max Orders Reached")
                         activate_lockdown("Daily Loss Limit Exceeded or Max Orders Reached")
 
