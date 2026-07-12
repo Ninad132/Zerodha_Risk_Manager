@@ -28,6 +28,8 @@ current_file_path = os.path.dirname(os.path.realpath(__file__))
 subscribed_tokens=set()
 price_cache = {}
 risk_manager_lock = None
+last_daily_journal_write = 0
+latest_daily_journal_values = {}
 
 
 kill_switch_path = os.path.join(
@@ -45,6 +47,31 @@ JOURNAL_FILE = os.path.join(
     current_file_path,
     "trade_journal.csv"
 )
+
+DAILY_JOURNAL_FILE = os.path.join(
+    current_file_path,
+    "daily_trade_journal.csv"
+)
+
+DAILY_JOURNAL_FIELDS = [
+    "trading_date",
+    "client_id",
+    "first_update",
+    "last_update",
+    "status",
+    "opening_balance",
+    "daily_loss_limit",
+    "closing_mtm",
+    "peak_mtm",
+    "lowest_mtm",
+    "completed_orders",
+    "open_positions",
+    "capital_used",
+    "kill_switch_triggered",
+    "kill_reason",
+    "notes"
+]
+DAILY_JOURNAL_UPDATE_INTERVAL_SECONDS = 60
 
 RISK_MANAGER_LOCK_FILE = os.path.join(
     current_file_path,
@@ -153,6 +180,142 @@ def log_journal(
             reason
         ])
 
+
+def _number(value, default=0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def update_daily_journal(
+    client_id,
+    opening_balance=None,
+    daily_loss_limit=None,
+    mtm=None,
+    completed_orders=None,
+    open_positions=None,
+    capital_used=None,
+    status=None,
+    kill_switch_triggered=None,
+    kill_reason=None,
+    notes=None
+):
+    """Upsert one restart-safe summary row per client and trading day."""
+    global last_daily_journal_write
+    global latest_daily_journal_values
+
+    supplied_values = {
+        "opening_balance": opening_balance,
+        "daily_loss_limit": daily_loss_limit,
+        "mtm": mtm,
+        "completed_orders": completed_orders,
+        "open_positions": open_positions,
+        "capital_used": capital_used,
+        "status": status,
+        "kill_switch_triggered": kill_switch_triggered,
+        "kill_reason": kill_reason,
+        "notes": notes
+    }
+    latest_daily_journal_values.update(
+        {
+            field: value
+            for field, value in supplied_values.items()
+            if value is not None
+        }
+    )
+
+    terminal_statuses = {"COMPLETED", "LOCKDOWN", "STOPPED"}
+    now_monotonic = time.monotonic()
+    if (
+        last_daily_journal_write
+        and status not in terminal_statuses
+        and now_monotonic - last_daily_journal_write
+        < DAILY_JOURNAL_UPDATE_INTERVAL_SECONDS
+    ):
+        return
+
+    opening_balance = latest_daily_journal_values.get("opening_balance")
+    daily_loss_limit = latest_daily_journal_values.get("daily_loss_limit")
+    mtm = latest_daily_journal_values.get("mtm")
+    completed_orders = latest_daily_journal_values.get("completed_orders")
+    open_positions = latest_daily_journal_values.get("open_positions")
+    capital_used = latest_daily_journal_values.get("capital_used")
+    status = latest_daily_journal_values.get("status")
+    kill_switch_triggered = latest_daily_journal_values.get(
+        "kill_switch_triggered"
+    )
+    kill_reason = latest_daily_journal_values.get("kill_reason")
+    notes = latest_daily_journal_values.get("notes")
+
+    rows = []
+    if os.path.exists(DAILY_JOURNAL_FILE):
+        with open(DAILY_JOURNAL_FILE, newline="") as f:
+            rows = list(csv.DictReader(f))
+
+    trading_date = today_ist()
+    row = next(
+        (
+            item for item in rows
+            if item.get("trading_date") == trading_date
+            and item.get("client_id") == client_id
+        ),
+        None
+    )
+
+    if row is None:
+        row = {field: "" for field in DAILY_JOURNAL_FIELDS}
+        row.update({
+            "trading_date": trading_date,
+            "client_id": client_id,
+            "first_update": now_ist_string(),
+            "status": "RUNNING",
+            "kill_switch_triggered": "False"
+        })
+        rows.append(row)
+
+    row["last_update"] = now_ist_string()
+
+    updates = {
+        "opening_balance": opening_balance,
+        "daily_loss_limit": daily_loss_limit,
+        "closing_mtm": mtm,
+        "completed_orders": completed_orders,
+        "open_positions": open_positions,
+        "capital_used": capital_used,
+        "status": status,
+        "kill_reason": kill_reason,
+        "notes": notes
+    }
+    for field, value in updates.items():
+        if value is not None:
+            row[field] = value
+
+    if mtm is not None:
+        if row["peak_mtm"] == "":
+            row["peak_mtm"] = mtm
+            row["lowest_mtm"] = mtm
+        else:
+            row["peak_mtm"] = max(_number(row["peak_mtm"]), mtm)
+            row["lowest_mtm"] = min(_number(row["lowest_mtm"]), mtm)
+
+    if kill_switch_triggered is not None:
+        row["kill_switch_triggered"] = str(bool(kill_switch_triggered))
+
+    temp_file = f"{DAILY_JOURNAL_FILE}.tmp"
+    with open(temp_file, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=DAILY_JOURNAL_FIELDS)
+        writer.writeheader()
+        writer.writerows(
+            {field: item.get(field, "") for field in DAILY_JOURNAL_FIELDS}
+            for item in rows
+        )
+        f.flush()
+        os.fsync(f.fileno())
+
+    os.replace(temp_file, DAILY_JOURNAL_FILE)
+    last_daily_journal_write = now_monotonic
+
 def activate_lockdown(reason, client_id=""):
 
     state = load_risk_state()
@@ -167,6 +330,13 @@ def activate_lockdown(reason, client_id=""):
         event="LOCKDOWN_ACTIVATE",
         client_id=client_id,
         reason=reason
+    )
+
+    update_daily_journal(
+        client_id=client_id,
+        status="LOCKDOWN",
+        kill_switch_triggered=True,
+        kill_reason=reason
     )
 
     enforce_lockdown_clear(client_id)
@@ -1058,6 +1228,13 @@ def run_engine():
     try:
         opening_balance = get_opening_balance(kite)
         loss_threshold = ensure_daily_threshold(kite, opening_balance)
+        update_daily_journal(
+            client_id=client_id,
+            opening_balance=opening_balance,
+            daily_loss_limit=loss_threshold,
+            status="RUNNING",
+            notes="No completed orders yet"
+        )
         while True:
             positions = get_all_positions()
             sync_subscriptions()
@@ -1067,6 +1244,10 @@ def run_engine():
             print("Current time: ", now.hour, now.minute)
             if now.hour >= 18:
                 logger.info("Day Complete. No More Trading Allowed. Shutting down Risk Manager for the day. ")
+                update_daily_journal(
+                    client_id=client_id,
+                    status="COMPLETED"
+                )
                 sys.exit()
 
             today = today_ist()
@@ -1112,6 +1293,22 @@ def run_engine():
 
                 MTM, order_len, open_orders = check_kill_condition(kite,positions)
                 update_peak_mtm(MTM)
+
+                update_daily_journal(
+                    client_id=client_id,
+                    opening_balance=opening_balance,
+                    daily_loss_limit=loss_threshold,
+                    mtm=MTM,
+                    completed_orders=order_len,
+                    open_positions=open_orders,
+                    capital_used=get_open_capital_used(positions),
+                    status="RUNNING",
+                    notes=(
+                        "No trades taken"
+                        if order_len == 0
+                        else "Trading activity recorded"
+                    )
+                )
 
                 logger.info(
                     f"{client_id} MTM: {MTM} | Threshold: {loss_threshold}"
@@ -1186,6 +1383,11 @@ def run_engine():
 
     except KeyboardInterrupt:
         logger.info("Engine stopped manually.")
+        update_daily_journal(
+            client_id=client_id,
+            status="STOPPED",
+            notes="Risk manager stopped manually"
+        )
         sys.exit()
 
 

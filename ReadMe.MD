@@ -42,6 +42,13 @@ This project runs in single-client mode. `credentials.json` must contain exactly
 6. The script limits deployed capital to 20% of the opening balance by cancelling oversized new-entry orders and closing positions if open capital is already above the cap.
 7. The script will wait for a specified time before checking again.
 
+## Trade journals
+
+- `trade_journal.csv` remains the detailed event log for rule triggers, lockdowns, and risk-engine errors.
+- `daily_trade_journal.csv` contains one row per client per trading date, including opening balance, loss limit, latest/closing MTM, highest and lowest MTM, completed orders, open positions, capital used, day status, and kill-switch details.
+- The daily row is created when the risk manager starts, updated once per minute while it runs, and finalized on normal completion, lockdown, or manual shutdown. Restarts update the same row instead of adding a duplicate day.
+- A day with no completed orders is recorded explicitly as `No trades taken`.
+
 ## Alt Usage
 1. You can also directly run the `kill_switch.py` script to manually activate the kill switch.
 2. This script will skip the checks and wont cancel orders or close positions, but directly activate the kill switch.

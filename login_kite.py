@@ -7,9 +7,11 @@ import traceback
 import subprocess
 import sys
 import fcntl
+import signal
 import get_kite_client
 
 RISK_MANAGER_PID_FILE = "risk_manager.pid"
+RISK_MANAGER_SCRIPT = "positions_kill_switch.py"
 
 
 def get_client_id():
@@ -45,15 +47,57 @@ def save_access_token(
         )
 
 
-def is_process_running(pid):
+def get_process_status_and_command(pid):
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "stat=", "-o", "command=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True
+        )
+    except OSError:
+        return None, ""
+
+    if result.returncode != 0:
+        return None, ""
+
+    output = result.stdout.strip()
+    if not output:
+        return None, ""
+
+    parts = output.split(None, 1)
+    status = parts[0]
+    command = parts[1] if len(parts) > 1 else ""
+    return status, command
+
+
+def is_process_running(pid, expected_script=None):
     try:
         os.kill(pid, 0)
-        return True
     except OSError:
         return False
 
+    status, command = get_process_status_and_command(pid)
+    if status is None:
+        return False
 
-def read_running_pid(pid_file):
+    if "Z" in status:
+        return False
+
+    if expected_script and expected_script not in command:
+        return False
+
+    return True
+
+
+def remove_stale_pid_file(pid_file):
+    try:
+        os.remove(pid_file)
+    except FileNotFoundError:
+        pass
+
+
+def read_running_pid(pid_file, expected_script):
     if not os.path.exists(pid_file):
         return None
 
@@ -61,16 +105,19 @@ def read_running_pid(pid_file):
         pid_text = f.read().strip()
 
     if not pid_text:
+        remove_stale_pid_file(pid_file)
         return None
 
     try:
         pid = int(pid_text)
     except ValueError:
+        remove_stale_pid_file(pid_file)
         return None
 
-    if is_process_running(pid):
+    if is_process_running(pid, expected_script):
         return pid
 
+    remove_stale_pid_file(pid_file)
     return None
 
 
@@ -84,14 +131,14 @@ def start_risk_manager_if_needed():
     with open(lock_file, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
 
-        running_pid = read_running_pid(pid_file)
-        if running_pid:
-            return running_pid, False
-
         risk_manager_path = os.path.join(
             current_file_path,
-            "positions_kill_switch.py"
+            RISK_MANAGER_SCRIPT
         )
+
+        running_pid = read_running_pid(pid_file, risk_manager_path)
+        if running_pid:
+            return running_pid, False
 
         log_file = open(
             os.path.join(current_file_path, "risk_manager.log"),
@@ -112,6 +159,7 @@ def start_risk_manager_if_needed():
 
 
 current_file_path = os.path.dirname(os.path.realpath(__file__))
+signal.signal(signal.SIGCHLD, signal.SIG_IGN)
 load_dotenv()
 app=Flask(__name__)
 app.secret_key = os.environ.get(
